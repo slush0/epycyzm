@@ -21,6 +21,7 @@ import multiprocessing
 from hashlib import sha256
 from optparse import OptionGroup, OptionParser
 from concurrent.futures._base import TimeoutError
+from asyncio import coroutine, coroutines, futures
 
 try:
     import PySide
@@ -54,11 +55,12 @@ class ServerSwitcher(object):
         self.servers = servers
         self.solvers = solvers
 
-    async def run(self):
+    @coroutine
+    def run(self):
         for server in itertools.cycle(self.servers):
             try:
                 client = StratumClient(self.loop, server, self.solvers)
-                await client.connect()
+                yield from client.connect()
             except KeyboardInterrupt:
                 print("Closing...")
                 self.solvers.stop()
@@ -67,7 +69,7 @@ class ServerSwitcher(object):
                 traceback.print_exc()
 
             print("Server connection closed, trying again...")
-            await asyncio.sleep(5)
+            yield from asyncio.sleep(5)
 
 class StratumNotifier(object):
     def __init__(self, reader, on_notify):
@@ -77,13 +79,18 @@ class StratumNotifier(object):
         self.task = None
 
     def run(self):
-        self.task = asyncio.ensure_future(self.observe())
+        # self.task = asyncio.ensure_future(self.observe())
+        self.task = asyncio.async(self.observe())
         return self.task
 
-    async def observe(self):
+    @coroutine
+    def observe(self):
         try:
             while True:
-                data = await self.reader.readline()
+                data = yield from self.reader.readline()
+                if data == b'':
+                    raise Exception("Server closed connection.")
+
                 try:
                     msg = json.loads(data.decode())
                 except:
@@ -91,7 +98,7 @@ class StratumNotifier(object):
 
                 if msg['id'] == None:
                     # It is notification
-                    await self.on_notify(msg)
+                    yield from self.on_notify(msg)
                 else:
                     # It is response of our call
                     self.waiters[int(msg['id'])].set_result(msg)
@@ -101,10 +108,11 @@ class StratumNotifier(object):
             traceback.print_exc()
             raise
 
-    async def wait_for(self, msg_id):
+    @coroutine
+    def wait_for(self, msg_id):
         f = asyncio.Future()
         self.waiters[msg_id] = f
-        return await asyncio.wait_for(f, 10)
+        return (yield from asyncio.wait_for(f, 10))
 
 class Job(object):
     @classmethod
@@ -204,7 +212,8 @@ class CpuSolver(threading.Thread):
 
                 if self.job.is_valid(header, solution, self.job.target):
                     print("FOUND VALID SOLUTION!")
-                    asyncio.run_coroutine_threadsafe(self.on_share(self.job, self.solver_nonce + nonce2, solution), self.loop)
+                    # asyncio.run_coroutine_threadsafe(self.on_share(self.job, self.solver_nonce + nonce2, solution), self.loop)
+                    asyncio.async(self.on_share(self.job, self.solver_nonce + nonce2, solution), loop=self.loop)
 
 class SolverPool(object):
     def __init__(self, loop, gpus=0, cpus=0):
@@ -247,20 +256,21 @@ class StratumClient(object):
         self.writer = None
         self.notifier = None
 
-    async def connect(self):
+    @coroutine
+    def connect(self):
         print("Connecting to", self.server)
         asyncio.open_connection()
-        reader, self.writer = await asyncio.open_connection(self.server.host, self.server.port, loop=self.loop)
+        reader, self.writer = yield from asyncio.open_connection(self.server.host, self.server.port, loop=self.loop)
 
         # Observe and route incoming message
         self.notifier = StratumNotifier(reader, self.on_notify)
         self.notifier.run()
 
-        await self.subscribe()
-        await self.authorize()
+        yield from self.subscribe()
+        yield from self.authorize()
 
         while True:
-            await asyncio.sleep(1)
+            yield from asyncio.sleep(1)
 
             if self.notifier.task.done():
                 # Notifier failed or wanted to stop procesing
@@ -275,7 +285,8 @@ class StratumClient(object):
         print('Close the socket')
         self.writer.close()
 
-    async def on_notify(self, msg):
+    @coroutine
+    def on_notify(self, msg):
         if msg['method'] == 'mining.notify':
             print("Giving new job to solvers")
             j = Job.from_params(msg['params'])
@@ -290,23 +301,26 @@ class StratumClient(object):
 
         print("Received unknown notification", msg)
 
-    async def authorize(self):
-        ret = await self.call('mining.authorize', self.server.username, self.server.password)
+    @coroutine
+    def authorize(self):
+        ret = yield from self.call('mining.authorize', self.server.username, self.server.password)
         if ret['result'] != True:
             raise Exception("Authorization failed: %s" % ret['error'])
         print("Successfully authorized as %s" % self.server.username)
 
-    async def subscribe(self):
-        ret = await self.call('mining.subscribe', VERSION, None, self.server.host, self.server.port)
+    @coroutine
+    def subscribe(self):
+        ret = yield from self.call('mining.subscribe', VERSION, None, self.server.host, self.server.port)
         nonce1 = binascii.unhexlify(ret['result'][1])
         print("Successfully subscribed for jobs")
         self.solvers.set_nonce(nonce1)
         return nonce1
 
-    async def submit(self, job, nonce2, solution):
+    @coroutine
+    def submit(self, job, nonce2, solution):
         t = time.time()
 
-        ret = await self.call('mining.submit',
+        ret = yield from self.call('mining.submit',
                         self.server.username,
                         job.job_id,
                         binascii.hexlify(job.ntime).decode('utf-8'),
@@ -317,7 +331,8 @@ class StratumClient(object):
         else:
             print("Share REJECTED in %.02fs" % (time.time() - t))
 
-    async def call(self, method, *params):
+    @coroutine
+    def call(self, method, *params):
         msg_id = self.new_id()
         msg = {"id": msg_id,
                "method": method,
@@ -328,8 +343,9 @@ class StratumClient(object):
         self.writer.write(data.encode())
 
         try:
-            r = asyncio.ensure_future(self.notifier.wait_for(msg_id))
-            await asyncio.wait([r, self.notifier.task], timeout=30, return_when=asyncio.FIRST_COMPLETED)
+            #r = asyncio.ensure_future(self.notifier.wait_for(msg_id))
+            r = asyncio.async(self.notifier.wait_for(msg_id))
+            yield from asyncio.wait([r, self.notifier.task], timeout=30, return_when=asyncio.FIRST_COMPLETED)
 
             if self.notifier.task.done():
                 raise self.notifier.task.exception()
