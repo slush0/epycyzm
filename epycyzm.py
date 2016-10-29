@@ -21,7 +21,6 @@ import multiprocessing
 from hashlib import sha256
 from optparse import OptionGroup, OptionParser
 from concurrent.futures._base import TimeoutError
-from concurrent.futures import FIRST_EXCEPTION, FIRST_COMPLETED
 
 try:
     import PySide
@@ -64,7 +63,7 @@ class ServerSwitcher(object):
                 print("Closing...")
                 self.solvers.stop()
                 break
-            except Exception as e:
+            except:
                 traceback.print_exc()
 
             print("Server connection closed, trying again...")
@@ -277,7 +276,6 @@ class StratumClient(object):
         self.writer.close()
 
     async def on_notify(self, msg):
-        print("Received notification", msg)
         if msg['method'] == 'mining.notify':
             print("Giving new job to solvers")
             j = Job.from_params(msg['params'])
@@ -289,6 +287,8 @@ class StratumClient(object):
             print("Received set.target")
             self.target = binascii.unhexlify(msg['params'][0])
             return
+
+        print("Received unknown notification", msg)
 
     async def authorize(self):
         ret = await self.call('mining.authorize', self.server.username, self.server.password)
@@ -304,12 +304,18 @@ class StratumClient(object):
         return nonce1
 
     async def submit(self, job, nonce2, solution):
+        t = time.time()
+
         ret = await self.call('mining.submit',
                         self.server.username,
                         job.job_id,
                         binascii.hexlify(job.ntime).decode('utf-8'),
                         binascii.hexlify(nonce2).decode('utf-8'),
                         binascii.hexlify(solution).decode('utf-8'))
+        if ret['result'] == True:
+            print("Share ACCEPTED in %.02fs" % (time.time() - t))
+        else:
+            print("Share REJECTED in %.02fs" % (time.time() - t))
 
     async def call(self, method, *params):
         msg_id = self.new_id()
@@ -318,18 +324,19 @@ class StratumClient(object):
                "params": params}
 
         data = "%s\n" % json.dumps(msg)
-        print('< %s' % data, end='')
+        print('< %s' % data[:200] + (data[200:] and "...\n"), end='')
         self.writer.write(data.encode())
 
         try:
             r = asyncio.ensure_future(self.notifier.wait_for(msg_id))
-            await asyncio.wait([r, self.notifier.task], timeout=10, return_when=FIRST_EXCEPTION)
+            await asyncio.wait([r, self.notifier.task], timeout=30, return_when=asyncio.FIRST_COMPLETED)
 
             if self.notifier.task.done():
                 raise self.notifier.task.exception()
 
             data = r.result()
-            print('> %s' % data)
+            log = '> %s' % data
+            print(log[:100] + (log[100:] and '...'))
 
         except TimeoutError:
             raise Exception("Request to server timed out.")
