@@ -20,6 +20,14 @@ import threading
 import multiprocessing
 from hashlib import sha256
 from optparse import OptionGroup, OptionParser
+from concurrent.futures._base import TimeoutError
+from concurrent.futures import FIRST_EXCEPTION, FIRST_COMPLETED
+
+try:
+    import PySide
+    gui_enabled = True
+except ImportError:
+    gui_enabled = False
 
 from morpavsolver import Solver
 from version import VERSION
@@ -49,9 +57,8 @@ class ServerSwitcher(object):
 
     async def run(self):
         for server in itertools.cycle(self.servers):
-            client = StratumClient(self.loop, server, self.solvers)
-
             try:
+                client = StratumClient(self.loop, server, self.solvers)
                 await client.connect()
             except KeyboardInterrupt:
                 print("Closing...")
@@ -61,21 +68,27 @@ class ServerSwitcher(object):
                 traceback.print_exc()
 
             print("Server connection closed, trying again...")
-            time.sleep(2)
+            await asyncio.sleep(5)
 
 class StratumNotifier(object):
-    def __init__(self, reader, on_stop, on_notify):
+    def __init__(self, reader, on_notify):
         self.waiters = {}
-        self.on_stop = on_stop
         self.on_notify = on_notify
+        self.reader = reader
+        self.task = None
 
-        asyncio.ensure_future(self.observe(reader))
+    def run(self):
+        self.task = asyncio.ensure_future(self.observe())
+        return self.task
 
-    async def observe(self, reader):
+    async def observe(self):
         try:
             while True:
-                data = await reader.readline()
-                msg = json.loads(data.decode())
+                data = await self.reader.readline()
+                try:
+                    msg = json.loads(data.decode())
+                except:
+                    raise Exception("Recieved corrupted data from server: %s" % data)
 
                 if msg['id'] == None:
                     # It is notification
@@ -87,12 +100,12 @@ class StratumNotifier(object):
         except Exception as e:
             # Do not try to recover from errors, let ServerSwitcher handle this
             traceback.print_exc()
-            self.on_stop.set_exception(e)
+            raise
 
     async def wait_for(self, msg_id):
         f = asyncio.Future()
         self.waiters[msg_id] = f
-        return await f
+        return await asyncio.wait_for(f, 10)
 
 class Job(object):
     @classmethod
@@ -132,13 +145,9 @@ class Job(object):
         assert (len(solution) == 1344 + 3)
 
         hash = sha256(sha256(header + solution).digest()).digest()[::-1]
+        print("hash %064x" % int.from_bytes(hash, 'big'))
 
-        print("hash", int.from_bytes(hash, 'big'))
-
-        if int.from_bytes(hash, 'big') < int.from_bytes(target, 'big'):
-            print(binascii.hexlify(hash).ljust(64, b'0'))
-            return True
-        return False
+        return int.from_bytes(hash, 'big') < int.from_bytes(target, 'big')
 
     def __repr__(self):
         return str(self.__dict__)
@@ -151,7 +160,7 @@ class CpuSolver(threading.Thread):
         self.counter = counter
 
         self.job = None
-        self.nonce1 = b''
+        self.nonce1 = None
         self.nonce2_int = 0
         self.on_share = None
 
@@ -159,9 +168,11 @@ class CpuSolver(threading.Thread):
         raise Exception("FIXME")
         self._stop = True
 
-    def new_job(self, job, nonce1, solver_nonce, on_share):
-        self.job = job
+    def set_nonce(self, nonce1):
         self.nonce1 = nonce1
+
+    def new_job(self, job, solver_nonce, on_share):
+        self.job = job
         self.solver_nonce = solver_nonce
         self.on_share = on_share
 
@@ -176,9 +187,9 @@ class CpuSolver(threading.Thread):
         print("Starting CPU solver")
         s = Solver()
 
-        while self.job == None:
-            time.sleep(0.1)
-            print("Waiting for jobs")
+        while self.job == None or self.nonce1 == None:
+            time.sleep(2)
+            print(".", end='', flush=True)
 
         while not self._stop:
             nonce2 = self.increase_nonce()
@@ -190,7 +201,7 @@ class CpuSolver(threading.Thread):
             self.counter(sol_cnt) # Increase counter for stats
 
             for i in range(sol_cnt):
-                solution = binascii.unhexlify('fd4005') + s.get_solution(i)
+                solution = b'\xfd\x40\x05' + s.get_solution(i)
 
                 if self.job.is_valid(header, solution, self.job.target):
                     print("FOUND VALID SOLUTION!")
@@ -211,10 +222,13 @@ class SolverPool(object):
         self.solutions += i
         print("%.02f H/s" % (self.solutions / (time.time() - self.time_start)))
 
-    def new_job(self, job, nonce1, on_share):
-        print("Giving new job to solvers")
+    def set_nonce(self, nonce1):
         for i, s in enumerate(self.solvers):
-            s.new_job(job, nonce1,
+            s.set_nonce(nonce1)
+
+    def new_job(self, job, on_share):
+        for i, s in enumerate(self.solvers):
+            s.new_job(job,
                       # Generate unique nonce1 for each solver
                       struct.pack('>B', i),
                       on_share)
@@ -230,11 +244,9 @@ class StratumClient(object):
         self.server = server
         self.solvers = solvers
         self.msg_id = 0 # counter of stratum messages
-        self.on_stop = asyncio.Future()
 
         self.writer = None
         self.notifier = None
-        self.nonce1 = None
 
     async def connect(self):
         print("Connecting to", self.server)
@@ -242,20 +254,19 @@ class StratumClient(object):
         reader, self.writer = await asyncio.open_connection(self.server.host, self.server.port, loop=self.loop)
 
         # Observe and route incoming message
-        self.notifier = StratumNotifier(reader, self.on_stop, self.on_notify)
+        self.notifier = StratumNotifier(reader, self.on_notify)
+        self.notifier.run()
 
-        self.nonce1 = await self.subscribe()
+        await self.subscribe()
         await self.authorize()
 
-
         while True:
+            await asyncio.sleep(1)
 
-            await asyncio.sleep(10)
-
-            if self.on_stop.done():
-                # Some component failed or wanted to stop procesing
+            if self.notifier.task.done():
+                # Notifier failed or wanted to stop procesing
                 # Let ServerSwitcher catch this and round-robin connection
-                raise self.on_stop.exception()
+                raise self.notifier.task.exception() or Exception("StratumNotifier failed, restarting.")
 
     def new_id(self):
         self.msg_id += 1
@@ -268,10 +279,10 @@ class StratumClient(object):
     async def on_notify(self, msg):
         print("Received notification", msg)
         if msg['method'] == 'mining.notify':
-            print("Received mining.notify")
+            print("Giving new job to solvers")
             j = Job.from_params(msg['params'])
             j.set_target(self.target)
-            self.solvers.new_job(j, self.nonce1, self.submit)
+            self.solvers.new_job(j, self.submit)
             return
 
         if msg['method'] == 'mining.set_target':
@@ -289,6 +300,7 @@ class StratumClient(object):
         ret = await self.call('mining.subscribe', VERSION, None, self.server.host, self.server.port)
         nonce1 = binascii.unhexlify(ret['result'][1])
         print("Successfully subscribed for jobs")
+        self.solvers.set_nonce(nonce1)
         return nonce1
 
     async def submit(self, job, nonce2, solution):
@@ -309,8 +321,19 @@ class StratumClient(object):
         print('< %s' % data, end='')
         self.writer.write(data.encode())
 
-        data = await self.notifier.wait_for(msg_id)
-        print('> %s' % data)
+        try:
+            r = asyncio.ensure_future(self.notifier.wait_for(msg_id))
+            await asyncio.wait([r, self.notifier.task], timeout=10, return_when=FIRST_EXCEPTION)
+
+            if self.notifier.task.done():
+                raise self.notifier.task.exception()
+
+            data = r.result()
+            print('> %s' % data)
+
+        except TimeoutError:
+            raise Exception("Request to server timed out.")
+
         return data
 
 def main():
@@ -320,6 +343,9 @@ def main():
             "Example usage: %prog stratum+tcp://slush.miner1:password@zcash.slushpool.com:4444"
 
     parser = OptionParser(version=VERSION, usage=usage)
+    parser.add_option('-g', '--disable-gui', dest='nogui',        action='store_true', help='Disable graphical interface, use console only')
+    parser.add_option('-c', '--cpu',         dest='cpu',          default=0,           help='How many CPU solvers to start (-1=disabled, 0=auto)', type='int')
+
     #parser.add_option('--verbose',        dest='verbose',        action='store_true', help='verbose output, suitable for redirection to log file')
     #parser.add_option('-q', '--quiet',    dest='quiet',          action='store_true', help='suppress all output except hash rate display')
     #parser.add_option('--proxy',          dest='proxy',          default='',          help='specify as [[socks4|socks5|http://]user:pass@]host:port (default proto is socks5)')
@@ -363,11 +389,25 @@ def main():
         parser.print_usage()
         return
 
+    if options.cpu == -1:
+        cpus = 0
+    elif options.cpu == 0:
+        cpus = multiprocessing.cpu_count()
+    else:
+        cpus = options.cpu
+
+    global gui_enabled
+    if options.nogui:
+        gui_enabled = False
+    elif not gui_enabled:
+        print("GUI disabled, please install PySide/Qt first.")
+
+    print("Using %d CPU solver instances" % cpus)
     print(servers)
 
     loop = asyncio.get_event_loop()
 
-    solvers = SolverPool(loop, gpus=0, cpus=multiprocessing.cpu_count())
+    solvers = SolverPool(loop, gpus=0, cpus=cpus)
     switcher = ServerSwitcher(loop, servers, solvers)
     loop.run_until_complete(switcher.run())
 
