@@ -5,7 +5,7 @@ Experimental Python CPU (yet) Zcash miner
 Inspired by m0mchil's poclbm (thanks!), but heavily rewritten with asyncio.
 
 (c) 2016 slush
-Public domain
+MIT license
 '''
 
 import re
@@ -107,17 +107,6 @@ class Job(object):
         j.nbits = binascii.unhexlify(params[6])
         j.clean_job = bool(params[7])
 
-        # TEST
-        '''
-        j.job_id = 'test'
-        j.version = binascii.unhexlify('04000000')
-        j.prev_hash = binascii.unhexlify('d88b45abc52c84d1345b6344b04a53abf92f05577b08c88d709fc110bb480200')
-        j.merkle_root = binascii.unhexlify('deb767c7c9cfdec27967faf5d0c09026da0b835b58a3acef9e39d7552db5e2a8')
-        j.reserved = binascii.unhexlify('0000000000000000000000000000000000000000000000000000000000000000')
-        j.ntime = binascii.unhexlify('1f7c1358')
-        j.nbits = binascii.unhexlify('22b5021f')
-        '''
-
         assert (len(j.version) == 4)
         assert (len(j.prev_hash) == 32)
         assert (len(j.merkle_root) == 32)
@@ -142,14 +131,9 @@ class Job(object):
         assert (len(header) == 140)
         assert (len(solution) == 1344 + 3)
 
-        tohash = header + solution
-
-        #print("TOHASH", binascii.hexlify(tohash))
-        hash = sha256(sha256(tohash).digest()).digest()[::-1]
-        #print("Block hash:", binascii.hexlify(hash))
+        hash = sha256(sha256(header + solution).digest()).digest()[::-1]
 
         print("hash", int.from_bytes(hash, 'big'))
-        #print("target", int.from_bytes(target, 'big'))
 
         if int.from_bytes(hash, 'big') < int.from_bytes(target, 'big'):
             print(binascii.hexlify(hash).ljust(64, b'0'))
@@ -158,7 +142,6 @@ class Job(object):
 
     def __repr__(self):
         return str(self.__dict__)
-
 
 class CpuSolver(threading.Thread):
     def __init__(self, loop, counter):
@@ -171,12 +154,6 @@ class CpuSolver(threading.Thread):
         self.nonce1 = b''
         self.nonce2_int = 0
         self.on_share = None
-
-        #self.loop = asyncio.new_event_loop()
-        #self.new_job = asyncio.Future(loop=self.loop)
-
-    #def run(self):
-    #    self.loop.run_until_complete(self.solver())
 
     def stop(self):
         raise Exception("FIXME")
@@ -210,16 +187,14 @@ class CpuSolver(threading.Thread):
             header = self.job.build_header(self.nonce1 + self.solver_nonce + nonce2)
 
             sol_cnt = s.find_solutions(header)
-            #print("Solutions found:", sol_cnt)
             self.counter(sol_cnt) # Increase counter for stats
+
             for i in range(sol_cnt):
                 solution = binascii.unhexlify('fd4005') + s.get_solution(i)
 
                 if self.job.is_valid(header, solution, self.job.target):
-                    #print(self.nonce1, self.solver_nonce, nonce2)
                     print("FOUND VALID SOLUTION!")
                     asyncio.run_coroutine_threadsafe(self.on_share(self.job, self.solver_nonce + nonce2, solution), self.loop)
-        #await self.new_job
 
 class SolverPool(object):
     def __init__(self, loop, gpus=0, cpus=0):
@@ -248,7 +223,7 @@ class SolverPool(object):
         for s in self.solvers:
             s.stop()
 
-# https://github.com/zcash/zips/pull/78
+# Stratum protocol specification: https://github.com/zcash/zips/pull/78
 class StratumClient(object):
     def __init__(self, loop, server, solvers):
         self.loop = loop
@@ -317,8 +292,6 @@ class StratumClient(object):
         return nonce1
 
     async def submit(self, job, nonce2, solution):
-        # TODO: Check solution against target
-
         ret = await self.call('mining.submit',
                         self.server.username,
                         job.job_id,
@@ -350,7 +323,7 @@ def main():
     #parser.add_option('--verbose',        dest='verbose',        action='store_true', help='verbose output, suitable for redirection to log file')
     #parser.add_option('-q', '--quiet',    dest='quiet',          action='store_true', help='suppress all output except hash rate display')
     #parser.add_option('--proxy',          dest='proxy',          default='',          help='specify as [[socks4|socks5|http://]user:pass@]host:port (default proto is socks5)')
-    parser.add_option('--no-ocl',         dest='no_ocl',         action='store_true', help="don't use OpenCL")
+    #parser.add_option('--no-ocl',         dest='no_ocl',         action='store_true', help="don't use OpenCL")
     #parser.add_option('-d', '--device',   dest='device',         default=[],          help='comma separated device IDs, by default will use all (for OpenCL - only GPU devices)')
 
     #group = OptionGroup(parser, "Miner Options")
@@ -376,15 +349,14 @@ def main():
     #group.add_option('--vv',             dest='vectors',    default=[],          help='use vectors, default false')
     #group.add_option('-v', '--vectors',  dest='old_vectors',action='store_true', help='use vectors')
     #parser.add_option_group(group)
-
-    (options, options.servers) = parser.parse_args()
-    options.version = VERSION
-
     #options.rate = max(options.rate, 60) if options.verbose else max(options.rate, 0.1)
     #options.max_update_time = 60
     #options.device = tokenize(options.device, 'device', [])
     #options.cutoff_temp = tokenize(options.cutoff_temp, 'cutoff_temp', [95], float)
     #options.cutoff_interval = tokenize(options.cutoff_interval, 'cutoff_interval', [0.01], float)
+
+    (options, options.servers) = parser.parse_args()
+    options.version = VERSION
 
     servers = [ Server.from_url(s) for s in options.servers]
     if len(servers) == 0:
@@ -395,41 +367,11 @@ def main():
 
     loop = asyncio.get_event_loop()
 
-    solvers = SolverPool(loop, gpus=0, cpus=4)#multiprocessing.cpu_count())
+    solvers = SolverPool(loop, gpus=0, cpus=multiprocessing.cpu_count())
     switcher = ServerSwitcher(loop, servers, solvers)
     loop.run_until_complete(switcher.run())
 
     loop.close()
-
-    '''
-    switch = None
-    try:
-        switch = Switch(options)
-
-        if not options.no_ocl:
-            import OpenCLMiner
-            for miner in OpenCLMiner.initialize(options):
-                switch.add_miner(miner)
-
-        if not switch.servers:
-            print('At least one server is required')
-        elif not switch.miners:
-            print('Nothing to mine on, exiting')
-        else:
-            for miner in switch.miners:
-                miner.start()
-            switch.loop()
-    except KeyboardInterrupt:
-        print('\nbye')
-    finally:
-        for miner in switch.miners:
-            miner.stop()
-        if switch: switch.stop()
-
-        if not options.no_ocl:
-            OpenCLMiner.shutdown()
-    sleep(1.1)
-    '''
 
 if __name__ == '__main__':
     main()
