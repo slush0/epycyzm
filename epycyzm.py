@@ -151,10 +151,10 @@ class Job(object):
         assert (len(header) == 140)
         assert (len(solution) == 1344 + 3)
 
-        hash = sha256(sha256(header + solution).digest()).digest()[::-1]
-        print("hash %064x" % int.from_bytes(hash, 'big'))
+        hash = sha256(sha256(header + solution).digest()).digest()
+        print("hash %064x" % int.from_bytes(hash, 'little'))
 
-        return int.from_bytes(hash, 'big') < int.from_bytes(target, 'big')
+        return int.from_bytes(hash, 'little') < target
 
     def __repr__(self):
         return str(self.__dict__)
@@ -296,7 +296,7 @@ class StratumClient(object):
 
         if msg['method'] == 'mining.set_target':
             print("Received set.target")
-            self.target = binascii.unhexlify(msg['params'][0])
+            self.target = int.from_bytes(binascii.unhexlify(msg['params'][0]), 'big')
             return
 
         print("Received unknown notification", msg)
