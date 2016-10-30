@@ -12,13 +12,14 @@ MIT license
 '''
 
 import re
-import asyncio
+import os
 import json
-import struct
 import time
+import struct
+import asyncio
+import binascii
 import itertools
 import traceback
-import binascii
 import threading
 import multiprocessing
 from hashlib import sha256
@@ -371,6 +372,7 @@ def main():
     parser = OptionParser(version=VERSION, usage=usage)
     parser.add_option('-g', '--disable-gui', dest='nogui',        action='store_true', help='Disable graphical interface, use console only')
     parser.add_option('-c', '--cpu',         dest='cpu',          default=0,           help='How many CPU solvers to start (-1=disabled, 0=auto)', type='int')
+    parser.add_option('-n', '--nice',       dest='nice',          default=0,        help="Niceness of the process (Linux only)", type='int')
 
     #parser.add_option('--verbose',        dest='verbose',        action='store_true', help='verbose output, suitable for redirection to log file')
     #parser.add_option('-q', '--quiet',    dest='quiet',          action='store_true', help='suppress all output except hash rate display')
@@ -414,6 +416,9 @@ def main():
     if len(servers) == 0:
         parser.print_usage()
         return
+
+    if options.nice is not 0:
+        print("Setting proces niceness to %d" % os.nice(options.nice))
 
     if options.cpu == -1:
         cpus = 0
