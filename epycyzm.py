@@ -4,6 +4,9 @@ Experimental Python CPU (yet) Zcash miner
 
 Inspired by m0mchil's poclbm (thanks!), but heavily rewritten with asyncio.
 
+Miner icon:
+http://www.flaticon.com/free-icon/miner_206873
+
 (c) 2016 slush
 MIT license
 '''
