@@ -1,0 +1,10 @@
+FROM debian:8
+FROM python:3.5
+
+MAINTAINER Ondrej Sika <ondrej@ondrejsika.com>
+
+RUN pip install cffi
+
+WORKDIR /epycyzm
+ENTRYPOINT ./run.sh
+
