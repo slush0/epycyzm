@@ -1,4 +1,4 @@
 #!/bin/bash
 
-docker run --name epycyzm --rm -ti epycyzm
+docker run --name epycyzm --rm -ti epycyzm "$@"
 
